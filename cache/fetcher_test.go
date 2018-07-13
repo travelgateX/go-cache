@@ -20,12 +20,39 @@ func keyFetchFunc(key string, exes *int, sleep time.Duration) FetchFunc {
 	}
 }
 
+func keyMFetchFunc(keys []string, exes *int, sleep time.Duration) MFetchFunc {
+	return func(bk string, keys []string) (value map[string]interface{}, err error) {
+		if exes != nil {
+			*exes++
+		}
+		if sleep != 0 {
+			time.Sleep(sleep)
+		}
+		ret := make(map[string]interface{})
+		for _, key := range keys {
+			ret[key] = "random" + key
+		}
+		return ret, nil
+	}
+}
+
 func assertFoundGet(t *testing.T, expected, retrieved interface{}, err error) {
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if retrieved != expected {
 		t.Errorf("retrieved %v expected to be %v", retrieved, expected)
+	}
+}
+
+func assertFoundMGet(t *testing.T, v map[string]interface{}, prefix string, err error) {
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	for key, val := range v {
+		if val != prefix+string(key) {
+			t.Errorf("retrieved %v expected to be %v", val, "random"+key)
+		}
 	}
 }
 
@@ -55,6 +82,24 @@ func TestPutGet(t *testing.T) {
 	assertStats(t, c.Stats(), 1, 1, 0)
 	if exes != 1 {
 		t.Error("only 1 execution expected")
+	}
+}
+
+func TestMPutMGet(t *testing.T) {
+	c, err := New(4, time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+	bk := "baseKey"
+	exes := 0
+	v, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
+	assertFoundMGet(t, v, "random", err)
+	c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
+	assertStats(t, c.Stats(), 4, 4, 0)
+	if exes != 1 {
+		t.Error("only 1 execution expected : was " + strconv.Itoa(exes))
 	}
 }
 
@@ -99,6 +144,26 @@ func TestGetError(t *testing.T) {
 	assertStats(t, c.Stats(), 0, 2, 0)
 }
 
+func TestMGetError(t *testing.T) {
+	c, err := New(4, time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	f := func(bk string, ks []string) (value map[string]interface{}, err error) {
+		return nil, errors.New("error")
+	}
+	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+	bk := "baseKey"
+	_, err = c.MGetOrFetch(bk, ks, f)
+	if err == nil {
+		t.Fatal("error expected")
+	}
+
+	c.MGetOrFetch(bk, ks, f)
+	assertStats(t, c.Stats(), 0, 8, 0)
+}
+
 func TestTTL(t *testing.T) {
 	t.Parallel()
 	c, err := New(1, 500*time.Millisecond)
@@ -126,6 +191,38 @@ func TestTTL(t *testing.T) {
 	assertStats(t, c.Stats(), 2, 1, 0)
 	if exes != 2 {
 		t.Error("only 2 execution expected")
+	}
+}
+
+func TestMTTL(t *testing.T) {
+	t.Parallel()
+	c, err := New(4, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+	bk := "baseKey"
+	exes := 0
+	v, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
+	assertFoundMGet(t, v, "random", err)
+
+	time.Sleep(500 * time.Microsecond)
+
+	// force an update
+	rks := []string{"28", "24", "12"}
+	v, err = c.MGetOrFetch(bk, rks, keyMFetchFunc(rks, &exes, 0))
+	// old value is retrieved
+	assertFoundMGet(t, v, "random", err)
+
+	time.Sleep(100 * time.Microsecond)
+
+	// the value should be updated now
+	v, err = c.MGetOrFetch(bk, rks, nil)
+	assertFoundMGet(t, v, "random", err)
+	assertStats(t, c.Stats(), 4, 6, 2)
+	if exes != 2 {
+		t.Error("only 2 execution expected found " + strconv.Itoa(exes))
 	}
 }
 

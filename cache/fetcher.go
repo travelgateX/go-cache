@@ -253,3 +253,100 @@ func (c *FetcherLRU) GetWithoutSingleFlight(key string, onFetch FetchFunc) (inte
 	}
 	return i.value, nil
 }
+
+type MFetchFunc func(baseKey string, keys []string) (value map[string]interface{}, err error)
+
+func (c *FetcherLRU) MGetOrFetch(baseKey string, keys []string, onFetch MFetchFunc) (map[string]interface{}, error) {
+	var i *item
+	var ok bool
+	// Map with keys to be fethced
+	var fetchKeys = make(map[string]*item)
+	ret := make(map[string]interface{})
+	hKeys := make(map[string]*struct{})
+
+	for _, key := range keys {
+		if t := hKeys[key]; t == nil {
+			// if hKeys has the current key means the key war processed previusly
+			hKeys[key] = &struct{}{}
+
+			if i, ok = c.get(baseKey + key); ok {
+				// key found in cache
+				atomic.AddInt64(&c.stats.Hits, 1)
+				// check and handle expiration, if the item is already in process
+				// to be updated, just return the value obtained from cache despite being old
+				if !i.updating && i.Expired() {
+					i.Lock()
+					// only the first thread has to request a fetch for an update; a double lock
+					// is used to ensure it
+					if !i.updating && i.Expired() {
+						i.updating = true
+						fetchKeys[key] = i
+					}
+				} else {
+					ret[key] = i.value
+				}
+			} else {
+				// key not found
+				atomic.AddInt64(&c.stats.Misses, 1)
+				// double check
+				if i, ok := c.peek(baseKey + key); !ok {
+					// add key to the list to fetch
+					fetchKeys[key] = nil
+				} else {
+					ret[key] = i.value
+				}
+			}
+		}
+
+	}
+
+	// if any key was missed, reuqest all keys using onFetch function
+	if len(fetchKeys) > 0 {
+		keyList := []string{}
+		// Create key list that will be fetched
+		for k := range fetchKeys {
+			keyList = append(keyList, k)
+		}
+
+		fetched, e := c.mfetch(baseKey, keyList, onFetch)
+		if e != nil {
+			return nil, e
+		}
+
+		for key, value := range fetched {
+			ret[key] = value
+		}
+
+	}
+
+	return ret, nil
+}
+
+// fetches a key's values and puts it on cache
+// in case the Item is not found, an empty Item is put in cache
+func (c *FetcherLRU) mfetch(baseKey string, keys []string, onFetch MFetchFunc) (map[string]interface{}, error) {
+
+	v, err := onFetch(baseKey, keys)
+	if err != nil {
+		return nil, err
+	}
+	ret := make(map[string]interface{})
+
+	for key, value := range v {
+		var eleRet *item
+		if value == nil {
+			eleRet = newEmptyItem(c.ttl)
+		} else {
+			eleRet = newItem(value, c.ttl)
+		}
+		eviction := c.cache.Add(baseKey+key, eleRet)
+		if eviction {
+			atomic.AddInt64(&c.stats.Evictions, 1)
+		}
+
+		eleRet.updating = false
+		ret[key] = eleRet.value
+	}
+
+	return ret, nil
+}
