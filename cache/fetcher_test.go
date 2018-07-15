@@ -9,7 +9,7 @@ import (
 )
 
 func keyFetchFunc(key string, exes *int, sleep time.Duration) FetchFunc {
-	return func() (value interface{}, err error) {
+	return func() (interface{}, error) {
 		if exes != nil {
 			*exes++
 		}
@@ -20,20 +20,28 @@ func keyFetchFunc(key string, exes *int, sleep time.Duration) FetchFunc {
 	}
 }
 
-func keyMFetchFunc(keys []string, exes *int, sleep time.Duration) MFetchFunc {
-	return func(bk string, keys []string) (value map[string]interface{}, err error) {
+func keyMFetchFunc(exes *int, sleep time.Duration) MFetchFunc {
+	return func(bk string, keys []string) ([]interface{}, error) {
 		if exes != nil {
 			*exes++
 		}
 		if sleep != 0 {
 			time.Sleep(sleep)
 		}
-		ret := make(map[string]interface{})
-		for _, key := range keys {
-			ret[key] = "random" + key
+		ret := make([]interface{}, len(keys))
+		for i := range keys {
+			ret[i] = keys[i]
 		}
 		return ret, nil
 	}
+}
+
+func stringsToEmptyInterface(strs []string) []interface{} {
+	ret := make([]interface{}, len(strs))
+	for i, str := range strs {
+		ret[i] = str
+	}
+	return ret
 }
 
 func assertFoundGet(t *testing.T, expected, retrieved interface{}, err error) {
@@ -45,18 +53,23 @@ func assertFoundGet(t *testing.T, expected, retrieved interface{}, err error) {
 	}
 }
 
-func assertFoundMGet(t *testing.T, v map[string]interface{}, prefix string, err error) {
+func assertFoundMGet(t *testing.T, expected, retrieved []interface{}, err error) {
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
-	for key, val := range v {
-		if val != prefix+string(key) {
-			t.Errorf("retrieved %v expected to be %v", val, "random"+key)
+
+	if len(expected) != len(retrieved) {
+		t.Fatalf("expected and retrieve values have different len: %v, %v", len(expected), len(retrieved))
+	}
+
+	for i, e := range expected {
+		if e != retrieved[i] {
+			t.Errorf("retrieved %v expected to be %v", retrieved[i], e)
 		}
 	}
 }
 
-func assertStats(t *testing.T, s Stats, hits, misses, evictions int64) {
+func assertStats(t *testing.T, s StatsFetcherLRU, hits, misses, evictions int64) {
 	if s.Hits != hits {
 		t.Errorf("expected %v hits, found %v", hits, s.Hits)
 	}
@@ -78,10 +91,11 @@ func TestPutGet(t *testing.T) {
 	exes := 0
 	v, err := c.GetOrFetch(k, keyFetchFunc(k, &exes, 0))
 	assertFoundGet(t, k, v, err)
+	assertStats(t, c.Stats(), 0, 1, 0)
 	c.GetOrFetch(k, keyFetchFunc(k, &exes, 0))
 	assertStats(t, c.Stats(), 1, 1, 0)
 	if exes != 1 {
-		t.Error("only 1 execution expected")
+		t.Error("only 1 execution expected, found " + strconv.Itoa(exes))
 	}
 }
 
@@ -94,12 +108,15 @@ func TestMPutMGet(t *testing.T) {
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
 	exes := 0
-	v, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
-	assertFoundMGet(t, v, "random", err)
-	c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
+	retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
+	expected := stringsToEmptyInterface(ks)
+	assertFoundMGet(t, expected, retrieved, err)
+	t.Logf("expected: %v, retrieved: %v", expected, retrieved)
+	assertStats(t, c.Stats(), 0, 4, 0)
+	c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
 	assertStats(t, c.Stats(), 4, 4, 0)
 	if exes != 1 {
-		t.Error("only 1 execution expected : was " + strconv.Itoa(exes))
+		t.Error("only 1 execution expected, found " + strconv.Itoa(exes))
 	}
 }
 
@@ -150,7 +167,7 @@ func TestMGetError(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
-	f := func(bk string, ks []string) (value map[string]interface{}, err error) {
+	f := func(bk string, ks []string) (value []interface{}, err error) {
 		return nil, errors.New("error")
 	}
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
@@ -190,7 +207,7 @@ func TestTTL(t *testing.T) {
 	assertFoundGet(t, "20", v, err)
 	assertStats(t, c.Stats(), 2, 1, 0)
 	if exes != 2 {
-		t.Error("only 2 execution expected")
+		t.Error("only 2 execution expected, found " + strconv.Itoa(exes))
 	}
 }
 
@@ -204,25 +221,31 @@ func TestMTTL(t *testing.T) {
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
 	exes := 0
-	v, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(ks, &exes, 0))
-	assertFoundMGet(t, v, "random", err)
+	retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
+	expected := stringsToEmptyInterface(ks)
+	assertFoundMGet(t, expected, retrieved, err)
 
-	time.Sleep(500 * time.Microsecond)
+	time.Sleep(500 * time.Millisecond)
 
 	// force an update
-	rks := []string{"28", "24", "12"}
-	v, err = c.MGetOrFetch(bk, rks, keyMFetchFunc(rks, &exes, 0))
+	updates := []interface{}{"28", "24", "12", "D"}
+	f := func(bk string, ks []string) (value []interface{}, err error) {
+		exes++
+		return updates, nil
+	}
+	retrieved, err = c.MGetOrFetch(bk, ks, f)
 	// old value is retrieved
-	assertFoundMGet(t, v, "random", err)
+	assertFoundMGet(t, retrieved, retrieved, err)
 
-	time.Sleep(100 * time.Microsecond)
+	time.Sleep(100 * time.Millisecond)
 
 	// the value should be updated now
-	v, err = c.MGetOrFetch(bk, rks, nil)
-	assertFoundMGet(t, v, "random", err)
-	assertStats(t, c.Stats(), 4, 6, 2)
+	updateExpected := []interface{}{"28", "24", "12", "D", "D", "12", "12"}
+	retrieved, err = c.MGetOrFetch(bk, ks, nil)
+	assertFoundMGet(t, updateExpected, retrieved, err)
+	assertStats(t, c.Stats(), 8, 4, 0)
 	if exes != 2 {
-		t.Error("only 2 execution expected found " + strconv.Itoa(exes))
+		t.Error("only 2 execution expected, found " + strconv.Itoa(exes))
 	}
 }
 

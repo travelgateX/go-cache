@@ -21,14 +21,7 @@ type FetcherLRU struct {
 	cache *hclru.Cache
 	ttl   time.Duration
 	group singleflight.Group
-	stats Stats
-}
-
-// Stats stores cache statistics
-type Stats struct {
-	Hits      int64
-	Misses    int64
-	Evictions int64
+	stats StatsFetcherLRU
 }
 
 // New creates a new instance of FetcherLRU
@@ -74,7 +67,7 @@ func (c *FetcherLRU) GetOrFetch(key string, onFetch FetchFunc) (interface{}, err
 			i.Lock()
 			// only the first thread has to request a fetch for an update; a double lock
 			// is used to ensure it
-			if !i.updating && i.Expired() {
+			if !i.updating {
 				i.updating = true
 				go func() {
 					_, err := c.fetch(key, onFetch)
@@ -119,17 +112,7 @@ func (c *FetcherLRU) fetch(key string, onFetch FetchFunc) (*item, error) {
 	if err != nil {
 		return nil, err
 	}
-	var i *item
-	if v == nil {
-		i = newEmptyItem(c.ttl)
-	} else {
-		i = newItem(v, c.ttl)
-	}
-	eviction := c.cache.Add(key, i)
-	if eviction {
-		atomic.AddInt64(&c.stats.Evictions, 1)
-	}
-	return i, nil
+	return c.add(key, v), nil
 }
 
 // get looks up a key's value from the cache updating its recent-ness
@@ -175,16 +158,8 @@ func (c *FetcherLRU) GetChan(key string, onFetch FetchFunc) <-chan Result {
 	return ch
 }
 
-type err string
-
-func (e err) Error() string { return string(e) }
-
-// ErrTimeout is the value returned by GetWithTimeout when the onFetch func lasts more
-// than a given duration, the OnFetch func is not cancelled.
-const ErrTimeout = err("timeout")
-
-// GetWithTimeout is the same as GetOrFetch but returns a timeout
-// error if the result is not ready on a given duration
+// GetWithTimeout is the same as GetOrFetch but returns a timeout error if the result is not ready on a given duration,
+// the FetchFunc won't be cancelled
 func (c *FetcherLRU) GetWithTimeout(key string, onFetch FetchFunc, timeout time.Duration) (interface{}, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -194,26 +169,6 @@ func (c *FetcherLRU) GetWithTimeout(key string, onFetch FetchFunc, timeout time.
 	case <-timer.C:
 	}
 	return nil, ErrTimeout
-}
-
-// Stats returns cache's Statistics
-func (c *FetcherLRU) Stats() Stats {
-	return c.stats
-}
-
-// Add forces an addition for a key's value
-func (c *FetcherLRU) Add(key string, value interface{}) {
-	var i *item
-	if value == nil {
-		i = newEmptyItem(c.ttl)
-	} else {
-		i = newItem(value, c.ttl)
-	}
-	evicted := c.cache.Add(key, i)
-	c.group.Forget(key)
-	if evicted {
-		atomic.AddInt64(&c.stats.Evictions, 1)
-	}
 }
 
 // GetWithoutSingleFlight for those cases where the group lock is not needed
@@ -254,99 +209,152 @@ func (c *FetcherLRU) GetWithoutSingleFlight(key string, onFetch FetchFunc) (inte
 	return i.value, nil
 }
 
-type MFetchFunc func(baseKey string, keys []string) (value map[string]interface{}, err error)
+// MFetchFunc expects the values returned to be in the same order as the keySuffixes requested
+type MFetchFunc func(keyPrefix string, keySuffixes []string) (values []interface{}, err error)
 
-func (c *FetcherLRU) MGetOrFetch(baseKey string, keys []string, onFetch MFetchFunc) (map[string]interface{}, error) {
-	var i *item
-	var ok bool
-	// Map with keys to be fethced
-	var fetchKeys = make(map[string]*item)
-	ret := make(map[string]interface{})
-	hKeys := make(map[string]*struct{})
+const ErrWrongMFetchResult = err("MFetchFunc error: keySuffixes and values returned doesn't have the same length")
 
-	for _, key := range keys {
-		if t := hKeys[key]; t == nil {
-			// if hKeys has the current key means the key war processed previusly
-			hKeys[key] = &struct{}{}
+// MGetOrFetch returns values in the same order which they were requested, nil values are possible as empty values.
+// onFetch func is executed for those values not found in memory or have expired, if all values to fetch are expired
+// then the onFetchFunck will be executed in his own goroutine and the results won't be waited
+func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
+	ret := make([]interface{}, len(keySuffixes))
 
-			if i, ok = c.get(baseKey + key); ok {
-				// key found in cache
-				atomic.AddInt64(&c.stats.Hits, 1)
-				// check and handle expiration, if the item is already in process
-				// to be updated, just return the value obtained from cache despite being old
-				if !i.updating && i.Expired() {
-					i.Lock()
-					// only the first thread has to request a fetch for an update; a double lock
-					// is used to ensure it
-					if !i.updating && i.Expired() {
-						i.updating = true
-						fetchKeys[key] = i
-					}
-				} else {
-					ret[key] = i.value
-				}
+	keysToFetchPrediction := len(keySuffixes)/2 + 1 // +1 for len 1 keys
+	keysToFetch := make([]string, 0, keysToFetchPrediction)
+	type entry struct {
+		key           string
+		item          *item
+		returnIndexes []int
+		isClean       bool
+	}
+	entries := make(map[string]*entry, keysToFetchPrediction)
+
+	var mustBlockFetch bool
+	var anyUpdate bool
+	for i, keySuffix := range keySuffixes {
+		// already processed keySuffixes use case
+		if e, ok := entries[keySuffix]; ok {
+			if e.isClean {
+				ret[i] = e.item.value
 			} else {
-				// key not found
-				atomic.AddInt64(&c.stats.Misses, 1)
-				// double check
-				if i, ok := c.peek(baseKey + key); !ok {
-					// add key to the list to fetch
-					fetchKeys[key] = nil
+				e.returnIndexes = append(e.returnIndexes, i)
+			}
+			continue
+		}
+
+		key := keyPrefix + keySuffix
+		if item, ok := c.get(key); ok {
+			// key found in cache
+			atomic.AddInt64(&c.stats.Hits, 1)
+			// check and handle expiration, if the item is already in process
+			// to be updated, just return the value obtained from cache despite being old
+			if !item.updating && item.Expired() {
+				item.Lock()
+				// only the first thread has to request a fetch for an update; a double lock
+				// is used to ensure it
+				if !item.updating {
+					item.updating = true
+					anyUpdate = true
+					keysToFetch = append(keysToFetch, keySuffix)
+					entries[keySuffix] = &entry{key, item, []int{i}, false}
 				} else {
-					ret[key] = i.value
+					entries[keySuffix] = &entry{item: item, isClean: true}
+				}
+				item.Unlock()
+			} else {
+				entries[keySuffix] = &entry{item: item, isClean: true}
+			}
+			ret[i] = item.value
+		} else {
+			// key not found
+			atomic.AddInt64(&c.stats.Misses, 1)
+			keysToFetch = append(keysToFetch, keySuffix)
+			entries[keySuffix] = &entry{key, nil, []int{i}, false}
+			mustBlockFetch = true
+		}
+	}
+
+	if len(keysToFetch) == 0 {
+		return ret, nil
+	}
+
+	// when all elements to fetch are in the update use case, updates can be done asynchronously,
+	// expired values are returned while the update is in progress
+	if !mustBlockFetch {
+		go func() {
+			values, err := onFetch(keyPrefix, keysToFetch)
+			if err != nil {
+				for _, entry := range entries {
+					if entry.item != nil {
+						entry.item.updating = false
+					}
+				}
+			}
+			if len(values) == len(keysToFetch) {
+				for i, v := range values {
+					keySuffix := keysToFetch[i]
+					entry := entries[keySuffix]
+					c.add(entry.key, v)
+				}
+			}
+		}()
+		return ret, nil
+	}
+
+	// blocking fetch
+	values, err := onFetch(keyPrefix, keysToFetch)
+	if err != nil {
+		if anyUpdate {
+			for _, v := range entries {
+				if v.item != nil {
+					v.item.updating = false
 				}
 			}
 		}
-
+		return ret, err
 	}
-
-	// if any key was missed, reuqest all keys using onFetch function
-	if len(fetchKeys) > 0 {
-		keyList := []string{}
-		// Create key list that will be fetched
-		for k := range fetchKeys {
-			keyList = append(keyList, k)
+	if len(values) != len(keysToFetch) {
+		return ret, ErrWrongMFetchResult
+	}
+	for i, v := range values {
+		keySuffix := keysToFetch[i]
+		entry := entries[keySuffix]
+		c.add(entry.key, v)
+		for _, i := range entry.returnIndexes {
+			ret[i] = v
 		}
-
-		fetched, e := c.mfetch(baseKey, keyList, onFetch)
-		if e != nil {
-			return nil, e
-		}
-
-		for key, value := range fetched {
-			ret[key] = value
-		}
-
 	}
 
 	return ret, nil
 }
 
-// fetches a key's values and puts it on cache
-// in case the Item is not found, an empty Item is put in cache
-func (c *FetcherLRU) mfetch(baseKey string, keys []string, onFetch MFetchFunc) (map[string]interface{}, error) {
+// Add forces an addition for a key's value
+func (c *FetcherLRU) Add(key string, value interface{}) {
+	c.add(key, value)
+}
 
-	v, err := onFetch(baseKey, keys)
-	if err != nil {
-		return nil, err
+func (c *FetcherLRU) add(key string, value interface{}) *item {
+	var i *item
+	if value == nil {
+		i = newEmptyItem(c.ttl)
+	} else {
+		i = newItem(value, c.ttl)
 	}
-	ret := make(map[string]interface{})
-
-	for key, value := range v {
-		var eleRet *item
-		if value == nil {
-			eleRet = newEmptyItem(c.ttl)
-		} else {
-			eleRet = newItem(value, c.ttl)
-		}
-		eviction := c.cache.Add(baseKey+key, eleRet)
-		if eviction {
-			atomic.AddInt64(&c.stats.Evictions, 1)
-		}
-
-		eleRet.updating = false
-		ret[key] = eleRet.value
+	evicted := c.cache.Add(key, i)
+	if evicted {
+		atomic.AddInt64(&c.stats.Evictions, 1)
 	}
+	return i
+}
 
-	return ret, nil
+type StatsFetcherLRU struct {
+	Hits      int64
+	Misses    int64
+	Evictions int64
+}
+
+// Stats returns a snapshot of the current cache's Stats
+func (c *FetcherLRU) Stats() StatsFetcherLRU {
+	return c.stats
 }
