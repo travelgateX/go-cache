@@ -226,7 +226,6 @@ func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch
 		key           string
 		item          *item
 		returnIndexes []int
-		isClean       bool
 	}
 	entries := make(map[string]*entry, keysToFetchPrediction)
 
@@ -235,7 +234,7 @@ func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch
 	for i, keySuffix := range keySuffixes {
 		// already processed keySuffixes use case
 		if e, ok := entries[keySuffix]; ok {
-			if e.isClean {
+			if e.item != nil {
 				ret[i] = e.item.value
 			} else {
 				e.returnIndexes = append(e.returnIndexes, i)
@@ -257,20 +256,20 @@ func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch
 					item.updating = true
 					anyUpdate = true
 					keysToFetch = append(keysToFetch, keySuffix)
-					entries[keySuffix] = &entry{key, item, []int{i}, false}
+					entries[keySuffix] = &entry{key, item, []int{i}}
 				} else {
-					entries[keySuffix] = &entry{item: item, isClean: true}
+					entries[keySuffix] = &entry{item: item}
 				}
 				item.Unlock()
 			} else {
-				entries[keySuffix] = &entry{item: item, isClean: true}
+				entries[keySuffix] = &entry{item: item}
 			}
 			ret[i] = item.value
 		} else {
 			// key not found
 			atomic.AddInt64(&c.stats.Misses, 1)
 			keysToFetch = append(keysToFetch, keySuffix)
-			entries[keySuffix] = &entry{key, nil, []int{i}, false}
+			entries[keySuffix] = &entry{key, nil, []int{i}}
 			mustBlockFetch = true
 		}
 	}
