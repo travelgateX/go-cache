@@ -414,3 +414,208 @@ func BenchmarkFibPar1000(b *testing.B)        { benchmarkExpensive(b, false, 100
 func BenchmarkFibSinglePar1000(b *testing.B)  { benchmarkExpensive(b, true, 1000) }
 func BenchmarkFibPar10000(b *testing.B)       { benchmarkExpensive(b, false, 10000) }
 func BenchmarkFibSinglePar10000(b *testing.B) { benchmarkExpensive(b, true, 10000) }
+
+func TestGetOrFetchForceLatest(t *testing.T) {
+	t.Parallel()
+	firstRoutineReturnLatestValueWhenKeyExpire(t, 1000)
+}
+
+func firstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) {
+	c, err := New(1, 1*time.Second, ForceLatestValue(true))
+	if err != nil {
+		t.Fatalf("unexpected error %oldValue", err)
+	}
+
+	//return the same value as key
+	keyFunc := func(key string, expected interface{}) FetchFunc {
+		ret := expected
+		return func() (interface{}, error) {
+			return ret, nil
+		}
+	}
+
+	//get value before expired
+	k := "10"
+	oldValue, err := c.GetOrFetch(k, keyFunc(k, k))
+	assertFoundGet(t, k, oldValue, err)
+	//let the value be expired
+	time.Sleep(1 * time.Second)
+
+	expected := "20"
+	firstWorking := make(chan bool)
+	firstFinished := make(chan bool)
+	wg := new(sync.WaitGroup)
+	wg.Add(routineCount)
+
+	// func that simulate a expensive work by the first routine
+	waitFunc := func(key string, expected interface{}) FetchFunc {
+		ret := expected
+		return func() (interface{}, error) {
+			// notify the other routines that first routine are working,they are ready to go
+			// since this routine is processing, other routines will get the old value
+			firstWorking <- true
+			//wait for other routines to finish in order to ensure that they are all returning the old value
+			wg.Wait()
+			return ret, nil
+		}
+	}
+
+	go func() {
+		v, err := c.GetOrFetch(k, waitFunc(k, expected))
+		if err != nil {
+			t.Errorf("unexpected error:%v", err)
+		} else {
+			if expected != v {
+				t.Errorf("expected:%v but return %v", expected, v)
+			}
+			//signal other routines that first routine updated the value
+			firstFinished <- true
+		}
+	}()
+
+	//block until the first routine is executing waitFunc, to ensure that there is one routine updating the key
+	<-firstWorking
+	for i := 1; i <= routineCount; i++ {
+		go func() {
+			defer wg.Done()
+			//must return old value
+			v, err := c.GetOrFetch(k, nil)
+
+			if err != nil {
+				t.Errorf("unexpected error:%v", err)
+			} else {
+				if oldValue != v {
+					t.Errorf("expected:%v but return %v", oldValue, v)
+				}
+
+			}
+
+		}()
+	}
+	wg.Wait()
+
+	//After the key has updated, now the key is NOT expired, we check if all routine return the updated value
+	<-firstFinished
+	wg = new(sync.WaitGroup)
+	wg.Add(routineCount)
+	for i := 1; i <= routineCount; i++ {
+		go func() {
+			defer wg.Done()
+			//must return new value
+			v, err := c.GetOrFetch(k, nil)
+			if err != nil {
+				t.Errorf("unexpected error:%v", err)
+			} else {
+				if expected != v {
+					t.Errorf("expected:%v but return %v", expected, v)
+				}
+
+			}
+
+		}()
+	}
+	wg.Wait()
+}
+
+func TestMGetOrFetchForceLatest(t *testing.T) {
+	t.Parallel()
+	MFirstRoutineReturnLatestValueWhenKeyExpire(t, 1000)
+}
+
+func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) {
+	c, err := New(5, 1*time.Second, ForceLatestValue(true))
+	if err != nil {
+		t.Fatalf("unexpected error %oldValue", err)
+	}
+
+	//return the same values as keys
+	MKeyFunc := func(keyPrefix string, keySuffix []string) MFetchFunc {
+		return func(keyPrefix string, keySuffix []string) ([]interface{}, error) {
+			ret := make([]interface{}, 0, len(keySuffix))
+			for _, value := range keySuffix {
+				ret = append(ret, value)
+			}
+			return ret, nil
+		}
+	}
+
+	//get value before expired
+	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+	bk := "baseKey"
+	retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+	expected := stringsToEmptyInterface(ks)
+	assertFoundMGet(t, expected, retrieved, err)
+	//let the values be expired
+	time.Sleep(1 * time.Second)
+
+	// now we test when key expired the first must wait to return all keys
+	newExpected:= []string{"10new", "1110new", "1210new", "1310new", "1310new", "1210new", "1210new"}
+	firstWorking := make(chan bool)
+	firstFinished := make(chan bool)
+	wg := new(sync.WaitGroup)
+	wg.Add(routineCount)
+
+
+	MWaitFunc := func(keyPrefix string, keySuffix []string) MFetchFunc {
+		return func(keyPrefix string, keySuffix []string) ([]interface{}, error) {
+			ret := make([]interface{}, 0, len(keySuffix))
+			for _, value := range keySuffix {
+				ret = append(ret, value+"new")
+			}
+			firstWorking <- true
+			//wait for other routines to finish in order to ensure that they are all returning the old value
+			wg.Wait()
+			return ret, nil
+		}
+	}
+
+
+	go func() {
+		v, err := c.MGetOrFetchForceLatest(bk,ks, MWaitFunc(bk, ks))
+		if err != nil {
+			t.Errorf("unexpected error:%v", err)
+		} else {
+			if expected != v {
+				t.Errorf("expected:%v but return %v", expected, v)
+			}
+			//signal other routines that first routine updated the value
+			firstFinished <- true
+		}
+	}()
+}
+
+//t.Parallel()
+//c, err := New(4, 500*time.Millisecond)
+//if err != nil {
+//t.Fatalf("unexpected error %v", err)
+//}
+//
+//ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+//bk := "baseKey"
+//exes := 0
+//retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
+//expected := stringsToEmptyInterface(ks)
+//assertFoundMGet(t, expected, retrieved, err)
+//
+//time.Sleep(500 * time.Millisecond)
+//
+//// force an update
+//updates := []interface{}{"28", "24", "12", "D"}
+//f := func(bk string, ks []string) (value []interface{}, err error) {
+//exes++
+//return updates, nil
+//}
+//retrieved, err = c.MGetOrFetch(bk, ks, f)
+//// old value is retrieved
+//assertFoundMGet(t, retrieved, retrieved, err)
+//
+//time.Sleep(100 * time.Millisecond)
+//
+//// the value should be updated now
+//updateExpected := []interface{}{"28", "24", "12", "D", "D", "12", "12"}
+//retrieved, err = c.MGetOrFetch(bk, ks, nil)
+//assertFoundMGet(t, updateExpected, retrieved, err)
+//assertStats(t, c.Stats(), 8, 4, 0)
+//if exes != 2 {
+//t.Error("only 2 execution expected, found " + strconv.Itoa(exes))
+//}
