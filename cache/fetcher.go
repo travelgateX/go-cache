@@ -83,35 +83,22 @@ func NewWithEvict(size int, ttl time.Duration, onEvicted EvictFunc) (*FetcherLRU
 type FetchFunc func() (value interface{}, err error)
 
 func (c *FetcherLRU) GetOrFetch(key string, onFetch FetchFunc) (interface{}, error) {
-	if c.forceLatestValue {
-		return c.getOrFetchForceLatest(key, onFetch)
-	} else {
-		return c.getOrFetchDefault(key, onFetch)
-	}
-}
-
-// GetOrFetchForceLatest looks up a key's value from the cache, returns nil as the value
-// to represent cached nil values, ensure that the first routine return the latest value
-// when the key has expired
-func (c *FetcherLRU) getOrFetchForceLatest(key string, onFetch FetchFunc) (interface{}, error) {
 	var i *item
 	var ok bool
 	if i, ok = c.get(key); ok {
 		// key found in cache
 		atomic.AddInt64(&c.stats.Hits, 1)
-		// check and handle expiration, if the item is already in process
-		// to be updated,the first routine ensure that the latest value,
-		// meanwhile other routines will return still return the old value
-		if i.Expired() {
-			// only the first thread has to request a fetch for an update; a double lock
-			// is used to ensure it
-			if !i.updating {
+		// check and handle expiration, only the first routine will update the key
+		// there is two type of update, force the first routine return the latest value, or return the
+		// key available in that moment
+		if !i.updating && i.Expired() {
+			if c.forceLatestValue {
+				// only the first thread has to request a fetch for an update; a double lock
+				// is used to ensure it
 				i.Lock()
 				defer i.Unlock()
 				i.updating = true
-
 				var err error
-
 				i, err = c.fetch(key, onFetch)
 				if err != nil {
 					// set loading to false only in case where the fetch failed,
@@ -119,48 +106,11 @@ func (c *FetcherLRU) getOrFetchForceLatest(key string, onFetch FetchFunc) (inter
 					// is not deleted
 					i.updating = false
 				}
-			}
-
-		}
-	} else {
-		// key not found
-		atomic.AddInt64(&c.stats.Misses, 1)
-		// group call per key
-		v, err, _ := c.group.Do(key, func() (interface{}, error) {
-			// double check
-			if i, ok := c.peek(key); ok {
-				return i, nil
-			}
-			return c.fetch(key, onFetch)
-		})
-		if err != nil {
-			// err is the same produced by the OnFetch func
-			return nil, err
-		}
-		// v will always be an item if not error
-		i = v.(*item)
-	}
-	if i.IsEmpty() {
-		return nil, nil
-	}
-	return i.value, nil
-}
-
-// GetOrFetchDefault looks up a key's value from the cache, returns nil as the value
-// to represent cached nil values, ensure that the first routine return the latest value
-func (c *FetcherLRU) getOrFetchDefault(key string, onFetch FetchFunc) (interface{}, error) {
-	var i *item
-	var ok bool
-	if i, ok = c.get(key); ok {
-		// key found in cache
-		atomic.AddInt64(&c.stats.Hits, 1)
-		// check and handle expiration, if the item is already in process
-		// to be updated, just return the value obtained from cache despite being old
-		if !i.updating && i.Expired() {
-			i.Lock()
-			// only the first thread has to request a fetch for an update; a double lock
-			// is used to ensure it
-			if !i.updating {
+			} else {
+				// only the first thread has to request a fetch for an update; a double lock
+				// is used to ensure it
+				i.Lock()
+				defer i.Unlock()
 				i.updating = true
 				go func() {
 					_, err := c.fetch(key, onFetch)
@@ -172,8 +122,9 @@ func (c *FetcherLRU) getOrFetchDefault(key string, onFetch FetchFunc) (interface
 					}
 				}()
 			}
-			i.Unlock()
+
 		}
+
 	} else {
 		// key not found
 		atomic.AddInt64(&c.stats.Misses, 1)
@@ -307,10 +258,19 @@ type MFetchFunc func(keyPrefix string, keySuffixes []string) (values []interface
 
 const ErrWrongMFetchResult = err("MFetchFunc error: keySuffixes and values returned doesn't have the same length")
 
+func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
+	if c.forceLatestValue {
+		return c.mGetOrFetchForceLatest(keyPrefix, keySuffixes, onFetch)
+
+	} else {
+		return c.mGetOrFetchDefault(keyPrefix, keySuffixes, onFetch)
+	}
+}
+
 // MGetOrFetch returns values in the same order which they were requested, nil values are possible as empty values.
 // onFetch func is executed for those values not found in memory or have expired, if all values to fetch are expired
 // then the onFetchFunc will be executed in his own goroutine and the results won't be waited
-func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
+func (c *FetcherLRU) mGetOrFetchDefault(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
 	ret := make([]interface{}, len(keySuffixes))
 
 	keysToFetchPrediction := len(keySuffixes)/2 + 1 // +1 for len 1 keys
@@ -421,10 +381,9 @@ func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch
 	return ret, nil
 }
 
-// MGetOrFetch returns values in the same order which they were requested, nil values are possible as empty values.
-// onFetch func is executed for those values not found in memory or have expired, if all values to fetch are expired
-// then the onFetchFunc will be executed in his own goroutine and the results won't be waited
-func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
+// this function is almost the same as mGetOrFetchDefault, but when there are expired keys, the first routine that
+// fetch new keys will block to ensure returned keys are newest
+func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
 	ret := make([]interface{}, len(keySuffixes))
 
 	keysToFetchPrediction := len(keySuffixes)/2 + 1 // +1 for len 1 keys
@@ -443,12 +402,9 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 	for i, keySuffix := range keySuffixes {
 		// if the key is repeated we get the key
 		if e, ok := entries[keySuffix]; ok {
-			// we can assign the same value to the same key only if the are not expired
-			if e.item != nil && e.item.Expired() {
-				// when is already updating, we can use the old keys,and we increment the counter
-				if e.item.updating {
-					atomic.AddInt32(updatingCount, 1)
-				}
+			// check if the key is updating
+			if e.item != nil && e.item.Expired() && e.item.updating {
+				atomic.AddInt32(updatingCount, 1)
 			}
 			e.returnIndexes = append(e.returnIndexes, i)
 			continue
@@ -473,9 +429,9 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 					entries[keySuffix] = &entry{key, item, []int{i}}
 					item.Unlock()
 				}
-			} else {
-				ret[i] = item.value
 			}
+			// key expired, but is updating, we return the old key
+			ret[i] = item.value
 		} else {
 			// key not found
 			atomic.AddInt64(&c.stats.Misses, 1)
@@ -483,12 +439,11 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 			entries[keySuffix] = &entry{key, nil, []int{i}}
 		}
 	}
-	// if we don't need fetch and the updating keys counter is equal as keys requested we return the old values
+	// if we don't need to fetch and all requested keys is updating we return old keys
 	if !needFetch && int(atomic.LoadInt32(updatingCount)) == len(keySuffixes) {
 		return ret, nil
 	} else if len(keysToFetch) == 0 {
 		return ret, nil
-		// we need to fetch all keys
 	} else {
 		values, err := onFetch(keyPrefix, keysToFetch)
 		if err != nil {

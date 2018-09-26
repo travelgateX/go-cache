@@ -542,7 +542,7 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	//get value before expired
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
-	retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+	retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
 	oldExpected := stringsToEmptyInterface(ks)
 	assertFoundMGet(t, oldExpected, retrieved, err)
 	//let the values be expired
@@ -570,7 +570,7 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	}
 
 	go func() {
-		retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+		retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
 		if err != nil {
 			t.Errorf("unexpected error:%v", err)
 		} else {
@@ -587,7 +587,7 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {
@@ -605,7 +605,7 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {

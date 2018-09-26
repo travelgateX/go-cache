@@ -12,7 +12,9 @@ type FetchFunc func() (value interface{}, err error)
 The getter method for this cache requires a key and a FetchFunc that will be executed when the key is not found or has expired, the OnFetch result will be stored in cache for that key.
 
 - Its concurrent safe
-- Gets on expired keys cause an update but are non-blocking, the old value is returned
+- Gets on expired keys
+    - default cause an update but are non-blocking, the old value is returned
+    - with ForceLatestValue option, the first routine will block , meanwhile other routines will get old value
 - Gets on missing keys are blocked until the OnFetch finishes
 - Ensures that only one OnFetch func is executed per key at the same time
 - Empty items are cached (nil values returned by a FetchFunc)
