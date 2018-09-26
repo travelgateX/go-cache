@@ -436,19 +436,23 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 	}
 	entries := make(map[string]*entry, keysToFetchPrediction)
 
-	var mustBlockFetch bool
-	var anyUpdate bool
+	// if some key is expired or is not available, we fetch and block
+	needFetch := false
+	// increment if the current key is already updating, if all key is updating, we will return old Keys
+	updatingCount := new(int32)
 	for i, keySuffix := range keySuffixes {
-		// already processed keySuffixes use case
+		// if the key is repeated we get the key
 		if e, ok := entries[keySuffix]; ok {
-			if e.item != nil {
-				ret[i] = e.item.value
-			} else {
-				e.returnIndexes = append(e.returnIndexes, i)
+			// we can assign the same value to the same key only if the are not expired
+			if e.item != nil && e.item.Expired() {
+				// when is already updating, we can use the old keys,and we increment the counter
+				if e.item.updating {
+					atomic.AddInt32(updatingCount, 1)
+				}
 			}
+			e.returnIndexes = append(e.returnIndexes, i)
 			continue
 		}
-
 		key := keyPrefix + keySuffix
 		if item, ok := c.get(key); ok {
 			// key found in cache
@@ -456,38 +460,36 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 			// check and handle expiration, if the item is already in process
 			// to be updated, just return the value obtained from cache despite being old
 			if item.Expired() {
-				item.Lock()
-				// only the first thread has to request a fetch for an update; a double lock
-				// is used to ensure it
+				// only the first routine has to request a fetch for an update;
+				// if the key is already updating, we increment the counter
 				if item.updating {
-					entries[keySuffix] = &entry{item: item}
+					atomic.AddInt32(updatingCount, 1)
+					ret[i] = item.value
 				} else {
+					needFetch = true
 					item.updating = true
-					anyUpdate = true
+					item.Lock()
 					keysToFetch = append(keysToFetch, keySuffix)
 					entries[keySuffix] = &entry{key, item, []int{i}}
+					item.Unlock()
 				}
-				item.Unlock()
 			} else {
-				entries[keySuffix] = &entry{item: item}
+				ret[i] = item.value
 			}
-			ret[i] = item.value
 		} else {
 			// key not found
 			atomic.AddInt64(&c.stats.Misses, 1)
 			keysToFetch = append(keysToFetch, keySuffix)
 			entries[keySuffix] = &entry{key, nil, []int{i}}
-			mustBlockFetch = true
 		}
 	}
-
-	if len(keysToFetch) == 0 {
+	// if we don't need fetch and the updating keys counter is equal as keys requested we return the old values
+	if !needFetch && int(atomic.LoadInt32(updatingCount)) == len(keySuffixes) {
 		return ret, nil
-	}
-
-	// when all elements to fetch are in the update use case, updates can be done asynchronously,
-	// expired values are returned while the update is in progress
-	if !mustBlockFetch {
+	} else if len(keysToFetch) == 0 {
+		return ret, nil
+		// we need to fetch all keys
+	} else {
 		values, err := onFetch(keyPrefix, keysToFetch)
 		if err != nil {
 			for _, entry := range entries {
@@ -496,38 +498,20 @@ func (c *FetcherLRU) MGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 				}
 			}
 		}
-		if len(values) == len(keysToFetch) {
+		if len(values) != len(keysToFetch) {
+			return ret, ErrWrongMFetchResult
+		} else {
 			for i, v := range values {
 				keySuffix := keysToFetch[i]
 				entry := entries[keySuffix]
 				c.add(entry.key, v)
-			}
-		}
-		return ret, nil
-	}
-
-	// blocking fetch
-	values, err := onFetch(keyPrefix, keysToFetch)
-	if err != nil {
-		if anyUpdate {
-			for _, v := range entries {
-				if v.item != nil {
-					v.item.updating = false
+				for _, i := range entry.returnIndexes {
+					ret[i] = v
 				}
 			}
 		}
-		return ret, err
-	}
-	if len(values) != len(keysToFetch) {
-		return ret, ErrWrongMFetchResult
-	}
-	for i, v := range values {
-		keySuffix := keysToFetch[i]
-		entry := entries[keySuffix]
-		c.add(entry.key, v)
-		for _, i := range entry.returnIndexes {
-			ret[i] = v
-		}
+
+		return ret, nil
 	}
 
 	return ret, nil

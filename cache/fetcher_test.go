@@ -448,7 +448,7 @@ func firstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) 
 	wg.Add(routineCount)
 
 	// func that simulate a expensive work by the first routine
-	waitFunc := func(key string, expected interface{}) FetchFunc {
+	waitFunc := func(key string, expected interface{}, wg *sync.WaitGroup) FetchFunc {
 		ret := expected
 		return func() (interface{}, error) {
 			// notify the other routines that first routine are working,they are ready to go
@@ -461,7 +461,7 @@ func firstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) 
 	}
 
 	go func() {
-		v, err := c.GetOrFetch(k, waitFunc(k, expected))
+		v, err := c.GetOrFetch(k, waitFunc(k, expected, wg))
 		if err != nil {
 			t.Errorf("unexpected error:%v", err)
 		} else {
@@ -519,7 +519,7 @@ func firstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) 
 
 func TestMGetOrFetchForceLatest(t *testing.T) {
 	t.Parallel()
-	MFirstRoutineReturnLatestValueWhenKeyExpire(t, 1000)
+	MFirstRoutineReturnLatestValueWhenKeyExpire(t, 10000)
 }
 
 func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) {
@@ -532,8 +532,8 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	MKeyFunc := func(keyPrefix string, keySuffix []string) MFetchFunc {
 		return func(keyPrefix string, keySuffix []string) ([]interface{}, error) {
 			ret := make([]interface{}, 0, len(keySuffix))
-			for _, value := range keySuffix {
-				ret = append(ret, value)
+			for i := range keySuffix {
+				ret = append(ret, keySuffix[i])
 			}
 			return ret, nil
 		}
@@ -543,25 +543,25 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
 	retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
-	expected := stringsToEmptyInterface(ks)
-	assertFoundMGet(t, expected, retrieved, err)
+	oldExpected := stringsToEmptyInterface(ks)
+	assertFoundMGet(t, oldExpected, retrieved, err)
 	//let the values be expired
 	time.Sleep(1 * time.Second)
 
 	// now we test when key expired the first must wait to return all keys
-	newExpected:= []string{"10new", "1110new", "1210new", "1310new", "1310new", "1210new", "1210new"}
+	newExpected := []interface{}{"10new", "11new", "12new", "13new", "13new", "12new", "12new"}
 	firstWorking := make(chan bool)
 	firstFinished := make(chan bool)
 	wg := new(sync.WaitGroup)
 	wg.Add(routineCount)
 
-
 	MWaitFunc := func(keyPrefix string, keySuffix []string) MFetchFunc {
 		return func(keyPrefix string, keySuffix []string) ([]interface{}, error) {
 			ret := make([]interface{}, 0, len(keySuffix))
-			for _, value := range keySuffix {
-				ret = append(ret, value+"new")
+			for i := range keySuffix {
+				ret = append(ret, keySuffix[i]+"new")
 			}
+			t.Log("generated key of first routine:", ret)
 			firstWorking <- true
 			//wait for other routines to finish in order to ensure that they are all returning the old value
 			wg.Wait()
@@ -569,53 +569,50 @@ func MFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 		}
 	}
 
-
 	go func() {
-		v, err := c.MGetOrFetchForceLatest(bk,ks, MWaitFunc(bk, ks))
+		retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
 		if err != nil {
 			t.Errorf("unexpected error:%v", err)
 		} else {
-			if expected != v {
-				t.Errorf("expected:%v but return %v", expected, v)
-			}
+			t.Log("Result of first routine:", retrieved)
+			assertFoundMGet(t, newExpected, retrieved, err)
 			//signal other routines that first routine updated the value
 			firstFinished <- true
 		}
 	}()
-}
 
-//t.Parallel()
-//c, err := New(4, 500*time.Millisecond)
-//if err != nil {
-//t.Fatalf("unexpected error %v", err)
-//}
-//
-//ks := []string{"10", "11", "12", "13", "13", "12", "12"}
-//bk := "baseKey"
-//exes := 0
-//retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
-//expected := stringsToEmptyInterface(ks)
-//assertFoundMGet(t, expected, retrieved, err)
-//
-//time.Sleep(500 * time.Millisecond)
-//
-//// force an update
-//updates := []interface{}{"28", "24", "12", "D"}
-//f := func(bk string, ks []string) (value []interface{}, err error) {
-//exes++
-//return updates, nil
-//}
-//retrieved, err = c.MGetOrFetch(bk, ks, f)
-//// old value is retrieved
-//assertFoundMGet(t, retrieved, retrieved, err)
-//
-//time.Sleep(100 * time.Millisecond)
-//
-//// the value should be updated now
-//updateExpected := []interface{}{"28", "24", "12", "D", "D", "12", "12"}
-//retrieved, err = c.MGetOrFetch(bk, ks, nil)
-//assertFoundMGet(t, updateExpected, retrieved, err)
-//assertStats(t, c.Stats(), 8, 4, 0)
-//if exes != 2 {
-//t.Error("only 2 execution expected, found " + strconv.Itoa(exes))
-//}
+	//block until the first routine is executing waitFunc, to ensure that there is one routine updating the key
+	<-firstWorking
+	for i := 1; i <= routineCount; i++ {
+		go func() {
+			defer wg.Done()
+			//must return old values
+			retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			if err != nil {
+				t.Errorf("unexpected error:%v", err)
+			} else {
+				assertFoundMGet(t, oldExpected, retrieved, err)
+			}
+
+		}()
+	}
+	wg.Wait()
+	<-firstFinished
+
+	wg = new(sync.WaitGroup)
+	wg.Add(routineCount)
+	for i := 1; i <= routineCount; i++ {
+		go func() {
+			defer wg.Done()
+			//must return old values
+			retrieved, err := c.MGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			if err != nil {
+				t.Errorf("unexpected error:%v", err)
+			} else {
+				assertFoundMGet(t, newExpected, retrieved, err)
+			}
+
+		}()
+	}
+	wg.Wait()
+}
