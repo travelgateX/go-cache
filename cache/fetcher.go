@@ -98,14 +98,15 @@ func (c *FetcherLRU) GetOrFetch(key string, onFetch FetchFunc) (interface{}, err
 				i.Lock()
 				defer i.Unlock()
 				i.updating = true
-				var err error
-				i, err = c.fetch(key, onFetch)
+				retrieved, err := c.fetch(key, onFetch)
 				if err != nil {
 					// set loading to false only in case where the fetch failed,
 					// the next look up will retry the fetch. Note that the expired item
-					// is not deleted
+					// is not deleted, and we will return old value
 					i.updating = false
+					return i.value, nil
 				}
+				return retrieved.value, nil
 			} else {
 				// only the first thread has to request a fetch for an update; a double lock
 				// is used to ensure it
@@ -122,9 +123,7 @@ func (c *FetcherLRU) GetOrFetch(key string, onFetch FetchFunc) (interface{}, err
 					}
 				}()
 			}
-
 		}
-
 	} else {
 		// key not found
 		atomic.AddInt64(&c.stats.Misses, 1)
@@ -275,11 +274,6 @@ func (c *FetcherLRU) mGetOrFetchDefault(keyPrefix string, keySuffixes []string, 
 
 	keysToFetchPrediction := len(keySuffixes)/2 + 1 // +1 for len 1 keys
 	keysToFetch := make([]string, 0, keysToFetchPrediction)
-	type entry struct {
-		key           string
-		item          *item
-		returnIndexes []int
-	}
 	entries := make(map[string]*entry, keysToFetchPrediction)
 
 	var mustBlockFetch bool
@@ -381,6 +375,12 @@ func (c *FetcherLRU) mGetOrFetchDefault(keyPrefix string, keySuffixes []string, 
 	return ret, nil
 }
 
+type entry struct {
+	key           string
+	item          *item
+	returnIndexes []int
+}
+
 // this function is almost the same as mGetOrFetchDefault, but when there are expired keys, the first routine that
 // fetch new keys will block to ensure returned keys are newest
 func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []string, onFetch MFetchFunc) ([]interface{}, error) {
@@ -388,11 +388,6 @@ func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 
 	keysToFetchPrediction := len(keySuffixes)/2 + 1 // +1 for len 1 keys
 	keysToFetch := make([]string, 0, keysToFetchPrediction)
-	type entry struct {
-		key           string
-		item          *item
-		returnIndexes []int
-	}
 	entries := make(map[string]*entry, keysToFetchPrediction)
 
 	// if some key is expired or is not available, we fetch and block
@@ -405,10 +400,13 @@ func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 			// check if the key is updating
 			if e.item != nil && e.item.Expired() && e.item.updating {
 				atomic.AddInt32(updatingCount, 1)
+				ret[i] = e.item.value
+
 			}
 			e.returnIndexes = append(e.returnIndexes, i)
 			continue
 		}
+
 		key := keyPrefix + keySuffix
 		if item, ok := c.get(key); ok {
 			// key found in cache
@@ -420,7 +418,6 @@ func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 				// if the key is already updating, we increment the counter
 				if item.updating {
 					atomic.AddInt32(updatingCount, 1)
-					ret[i] = item.value
 				} else {
 					needFetch = true
 					item.updating = true
@@ -452,8 +449,9 @@ func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 					entry.item.updating = false
 				}
 			}
+			return ret, nil
 		}
-		if len(values) != len(keysToFetch) {
+		if len(values) != len(keysToFetch) && len(ret) != len(keySuffixes) {
 			return ret, ErrWrongMFetchResult
 		} else {
 			for i, v := range values {
@@ -468,8 +466,6 @@ func (c *FetcherLRU) mGetOrFetchForceLatest(keyPrefix string, keySuffixes []stri
 
 		return ret, nil
 	}
-
-	return ret, nil
 }
 
 // Add forces an addition for a key's value
