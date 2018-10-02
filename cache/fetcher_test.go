@@ -9,79 +9,6 @@ import (
 	"time"
 )
 
-func keyFetchFunc(key string, exes *int, sleep time.Duration) FetchFunc {
-	return func() (interface{}, error) {
-		if exes != nil {
-			*exes++
-		}
-		if sleep != 0 {
-			time.Sleep(sleep)
-		}
-		return key, nil
-	}
-}
-
-func keyMFetchFunc(exes *int, sleep time.Duration) MFetchFunc {
-	return func(bk string, keys []string) ([]interface{}, error) {
-		if exes != nil {
-			*exes++
-		}
-		if sleep != 0 {
-			time.Sleep(sleep)
-		}
-		ret := make([]interface{}, len(keys))
-		for i := range keys {
-			ret[i] = keys[i]
-		}
-		return ret, nil
-	}
-}
-
-func stringsToEmptyInterface(strs []string) []interface{} {
-	ret := make([]interface{}, len(strs))
-	for i, str := range strs {
-		ret[i] = str
-	}
-	return ret
-}
-
-func assertFoundGet(t *testing.T, expected, retrieved interface{}, err error) {
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-	if retrieved != expected {
-		t.Errorf("retrieved %v expected to be %v", retrieved, expected)
-	}
-}
-
-func assertFoundMGet(t *testing.T, expected, retrieved []interface{}, err error) {
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-
-	if len(expected) != len(retrieved) {
-		t.Fatalf("expected and retrieve values have different len: %v, %v", len(expected), len(retrieved))
-	}
-
-	for i, e := range expected {
-		if e != retrieved[i] {
-			t.Errorf("retrieved %v expected to be %v", retrieved[i], e)
-		}
-	}
-}
-
-func assertStats(t *testing.T, s StatsFetcherLRU, hits, misses, evictions int64) {
-	if s.Hits != hits {
-		t.Errorf("expected %v hits, found %v", hits, s.Hits)
-	}
-	if s.Misses != misses {
-		t.Errorf("expected %v Misses, found %v", misses, s.Misses)
-	}
-	if s.Evictions != evictions {
-		t.Errorf("expected %v Evictions, found %v", evictions, s.Evictions)
-	}
-}
-
 func TestPutGet(t *testing.T) {
 	c, err := New(1, time.Minute)
 	if err != nil {
@@ -114,6 +41,7 @@ func TestMPutMGet(t *testing.T) {
 	assertFoundMGet(t, expected, retrieved, err)
 	t.Logf("expected: %v, retrieved: %v", expected, retrieved)
 	assertStats(t, c.Stats(), 0, 4, 0)
+
 	c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
 	assertStats(t, c.Stats(), 4, 4, 0)
 	if exes != 1 {
@@ -213,7 +141,6 @@ func TestTTL(t *testing.T) {
 }
 
 func TestMTTL(t *testing.T) {
-	t.Parallel()
 	c, err := New(4, 500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
@@ -234,9 +161,9 @@ func TestMTTL(t *testing.T) {
 		exes++
 		return updates, nil
 	}
-	retrieved, err = c.MGetOrFetch(bk, ks, f)
-	// old value is retrieved
-	assertFoundMGet(t, retrieved, retrieved, err)
+	retrieved2, err := c.MGetOrFetch(bk, ks, f)
+	// old value is retrieved, update is non-blocking
+	assertFoundMGet(t, retrieved, retrieved2, err)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -248,6 +175,33 @@ func TestMTTL(t *testing.T) {
 	if exes != 2 {
 		t.Error("only 2 execution expected, found " + strconv.Itoa(exes))
 	}
+}
+
+func TestMTTL_BlockOnUpdates(t *testing.T) {
+	c, err := New(4, 500*time.Millisecond, SetBlockOnUpdatingGoroutine())
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
+	bk := "baseKey"
+	exes := 0
+	retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(&exes, 0))
+	expected := stringsToEmptyInterface(ks)
+	assertFoundMGet(t, expected, retrieved, err)
+
+	time.Sleep(500 * time.Millisecond)
+
+	// force an update
+	updates := []interface{}{"28", "24", "12", "D"}
+	updateExpected := []interface{}{"28", "24", "12", "D", "D", "12", "12"}
+	f := func(bk string, ks []string) (value []interface{}, err error) {
+		exes++
+		return updates, nil
+	}
+	retrieved, err = c.MGetOrFetch(bk, ks, f)
+	// old value is retrieved, update is non-blocking
+	assertFoundMGet(t, updateExpected, retrieved, err)
 }
 
 func TestSingleflight(t *testing.T) {
@@ -302,141 +256,99 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
-func benchmark(b *testing.B, useSingleFlight bool, fetchDuration time.Duration, parallelism int) {
-	c, err := New(100, 500*time.Millisecond)
+// keyFetchFunc returns a 'FetchFunc' which returns the value 'key' as result, increases
+// an 'exes' integer which is a count of the executions of the FetchFunc, also an optionally sleep
+// is done as a helper to test TTL or goroutines blocking
+func keyFetchFunc(key string, exes *int, sleep time.Duration) FetchFunc {
+	return func() (interface{}, error) {
+		if exes != nil {
+			*exes++
+		}
+		if sleep != 0 {
+			time.Sleep(sleep)
+		}
+		return key, nil
+	}
+}
+
+func keyMFetchFunc(exes *int, sleep time.Duration) MFetchFunc {
+	return func(bk string, keys []string) ([]interface{}, error) {
+		if exes != nil {
+			*exes++
+		}
+		if sleep != 0 {
+			time.Sleep(sleep)
+		}
+		ret := make([]interface{}, len(keys))
+		for i := range keys {
+			ret[i] = keys[i]
+		}
+		return ret, nil
+	}
+}
+
+func stringsToEmptyInterface(strs []string) []interface{} {
+	ret := make([]interface{}, len(strs))
+	for i, str := range strs {
+		ret[i] = str
+	}
+	return ret
+}
+
+// assertFoundGet checks that err es nil and the value retrieved matches with the expected
+func assertFoundGet(t *testing.T, expected, retrieved interface{}, err error) {
 	if err != nil {
-		b.Fatalf("unexpected error %v", err)
+		t.Fatalf("unexpected error %v", err)
 	}
-
-	f := keyFetchFunc("", nil, fetchDuration)
-	jobs := make(chan int, parallelism)
-	for w := 0; w < parallelism; w++ {
-		go worker(c, f, jobs, useSingleFlight)
-	}
-
-	p := -1
-	for n := 0; n < b.N; n++ {
-		if n%parallelism == 0 {
-			p++
-		}
-		jobs <- p
-	}
-	close(jobs)
-}
-
-func worker(c *FetcherLRU, f FetchFunc, js <-chan int, useSingleFlight bool) {
-	for j := range js {
-		if useSingleFlight {
-			c.GetOrFetch(strconv.Itoa(j), f)
-		} else {
-			c.GetWithoutSingleFlight(strconv.Itoa(j), f)
-		}
+	if retrieved != expected {
+		t.Errorf("retrieved %v expected to be %v", retrieved, expected)
 	}
 }
 
-func BenchmarkSleep10Par0(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 1) }
-func BenchmarkSingleSleep10Par0(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 1) }
-
-func BenchmarkSleep10Par10(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 10) }
-func BenchmarkSingleSleep10Par10(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 10) }
-
-func BenchmarkSleep10Par100(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 100) }
-func BenchmarkSingleSleep10Par100(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 100) }
-
-func BenchmarkSleep10Par1000(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 1000) }
-func BenchmarkSingleSleep10Par1000(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 1000) }
-
-func BenchmarkSleep100Par0(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 1) }
-func BenchmarkSingleSleep100Par0(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 1) }
-
-func BenchmarkSleep100Par10(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 10) }
-func BenchmarkSingleSleep100Par10(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 10) }
-
-func BenchmarkSleep100Par100(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 100) }
-func BenchmarkSingleSleep100Par100(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 100) }
-
-func BenchmarkSleep100Par1000(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 1000) }
-func BenchmarkSingleSleep100Par1000(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 1000) }
-
-func BenchmarkSleep200Par0(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 1) }
-func BenchmarkSingleSleep200Par0(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 1) }
-
-func BenchmarkSleep200Par10(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 10) }
-func BenchmarkSingleSleep200Par10(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 10) }
-
-func BenchmarkSleep200Par100(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 100) }
-func BenchmarkSingleSleep200Par100(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 100) }
-
-func BenchmarkSleep200Par1000(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 1000) }
-func BenchmarkSingleSleep200Par1000(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 1000) }
-
-func benchmarkExpensive(b *testing.B, useSingleFlight bool, parallelism int) {
-	c, err := New(100, 500*time.Millisecond)
+// assertFoundGet checks that err es nil and the values retrieved match with the expected
+func assertFoundMGet(t *testing.T, expected, retrieved []interface{}, err error) {
 	if err != nil {
-		b.Fatalf("unexpected error %v", err)
+		t.Fatalf("unexpected error %v", err)
 	}
 
-	f := func() (interface{}, error) {
-		return Fib(20), nil
+	if len(expected) != len(retrieved) {
+		t.Fatalf("expected and retrieve values have different len: %v, %v", len(expected), len(retrieved))
 	}
 
-	jobs := make(chan int, parallelism)
-	for w := 0; w < parallelism; w++ {
-		go worker(c, f, jobs, useSingleFlight)
-	}
-
-	p := -1
-	for n := 0; n < b.N; n++ {
-		if n%parallelism == 0 {
-			p++
+	for i, e := range expected {
+		if e != retrieved[i] {
+			t.Errorf("retrieved %v expected to be %v", retrieved[i], e)
 		}
-		jobs <- p
 	}
-	close(jobs)
 }
 
-func Fib(n int) int {
-	if n < 2 {
-		return n
+// assertStats takes 'StatsFetcherLRU' and asserts his expected values
+func assertStats(t *testing.T, s StatsFetcherLRU, hits, misses, evictions int64) {
+	if s.Hits != hits {
+		t.Errorf("expected %v hits, found %v", hits, s.Hits)
 	}
-	return Fib(n-1) + Fib(n-2)
+	if s.Misses != misses {
+		t.Errorf("expected %v Misses, found %v", misses, s.Misses)
+	}
+	if s.Evictions != evictions {
+		t.Errorf("expected %v Evictions, found %v", evictions, s.Evictions)
+	}
 }
 
-func BenchmarkFibPar0(b *testing.B)       { benchmarkExpensive(b, false, 1) }
-func BenchmarkFibSinglePar0(b *testing.B) { benchmarkExpensive(b, true, 1) }
-
-func BenchmarkFibPar10(b *testing.B)       { benchmarkExpensive(b, false, 10) }
-func BenchmarkFibSinglePar10(b *testing.B) { benchmarkExpensive(b, true, 10) }
-
-func BenchmarkFibPar100(b *testing.B)       { benchmarkExpensive(b, false, 100) }
-func BenchmarkFibSinglePar100(b *testing.B) { benchmarkExpensive(b, true, 100) }
-
-func BenchmarkFibPar1000(b *testing.B)        { benchmarkExpensive(b, false, 1000) }
-func BenchmarkFibSinglePar1000(b *testing.B)  { benchmarkExpensive(b, true, 1000) }
-func BenchmarkFibPar10000(b *testing.B)       { benchmarkExpensive(b, false, 10000) }
-func BenchmarkFibSinglePar10000(b *testing.B) { benchmarkExpensive(b, true, 10000) }
-
-func TestGetOrFetchForceLatest(t *testing.T) {
+func TestGetBlockOnUpdatingGoroutine(t *testing.T) {
 	t.Parallel()
 	firstRoutineReturnLatestValueWhenKeyExpire(t, 1000)
 }
+
 func firstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) {
-	c, err := New(1, 1*time.Second, ForceLatestValue(true))
+	c, err := New(1, 1*time.Second, SetBlockOnUpdatingGoroutine())
 	if err != nil {
 		t.Fatalf("unexpected error %oldValue", err)
 	}
 
-	//return the same value as key
-	keyFunc := func(key string, expected interface{}) FetchFunc {
-		ret := expected
-		return func() (interface{}, error) {
-			return ret, nil
-		}
-	}
-
 	//get value before expired
 	k := "10"
-	oldValue, err := c.GetOrFetch(k, keyFunc(k, k))
+	oldValue, err := c.GetOrFetch(k, keyFetchFunc(k, nil, 0))
 	assertFoundGet(t, k, oldValue, err)
 	//let the value be expired
 	time.Sleep(1 * time.Second)
@@ -523,22 +435,14 @@ func TestGetOrFetchForceLatestFetchError(t *testing.T) {
 }
 
 func firstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routineCount int) {
-	c, err := New(1, 1*time.Second, ForceLatestValue(true))
+	c, err := New(1, 1*time.Second, SetBlockOnUpdatingGoroutine())
 	if err != nil {
 		t.Fatalf("unexpected error %oldValue", err)
 	}
 
-	//return the same value as key
-	keyFunc := func(key string, expected interface{}) FetchFunc {
-		ret := expected
-		return func() (interface{}, error) {
-			return ret, nil
-		}
-	}
-
 	//get value before expired
 	k := "10"
-	oldValue, err := c.GetOrFetch(k, keyFunc(k, k))
+	oldValue, err := c.GetOrFetch(k, keyFetchFunc(k, nil, 0))
 	assertFoundGet(t, k, oldValue, err)
 	//let the value be expired
 	time.Sleep(1 * time.Second)
@@ -625,20 +529,8 @@ func TestMGetOrFetchForceLatest(t *testing.T) {
 	mFirstRoutineReturnLatestValueWhenKeyExpire(t, 2)
 }
 
-
-//return the same values as keys
-var MKeyFunc = func(keyPrefix string, keySuffix []string) MFetchFunc {
-	return func(keyPrefix string, keySuffix []string) ([]interface{}, error) {
-		ret := make([]interface{}, 0, len(keySuffix))
-		for i := range keySuffix {
-			ret = append(ret, keySuffix[i])
-		}
-		return ret, nil
-	}
-}
-
 func mFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int) {
-	c, err := New(5, 1*time.Second, ForceLatestValue(true))
+	c, err := New(5, 1*time.Second, SetBlockOnUpdatingGoroutine())
 	if err != nil {
 		t.Fatalf("unexpected error %oldValue", err)
 	}
@@ -646,7 +538,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	//get value before expired
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
-	retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+	retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(nil, 0))
 	oldExpected := stringsToEmptyInterface(ks)
 	assertFoundMGet(t, oldExpected, retrieved, err)
 	//let the values be expired
@@ -674,7 +566,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 	}
 
 	go func() {
-		retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+		retrieved, err := c.MGetOrFetch(bk, ks, MWaitFunc(bk, ks))
 		if err != nil {
 			t.Errorf("unexpected error:%v", err)
 		} else {
@@ -691,7 +583,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			retrieved, err := c.MGetOrFetch(bk, ks, MWaitFunc(bk, ks))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {
@@ -709,7 +601,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpire(t *testing.T, routineCount int)
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+			retrieved, err := c.MGetOrFetch(bk, ks, MWaitFunc(bk, ks))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {
@@ -725,20 +617,16 @@ func TestMGetOrFetchForceLatestFetchError(t *testing.T) {
 	mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t, 10000)
 }
 
-
-
 func mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routineCount int) {
-	c, err := New(5, 1*time.Second, ForceLatestValue(true))
+	c, err := New(5, 1*time.Second, SetBlockOnUpdatingGoroutine())
 	if err != nil {
 		t.Fatalf("unexpected error %oldValue", err)
 	}
 
-
-
 	//get value before expired
 	ks := []string{"10", "11", "12", "13", "13", "12", "12"}
 	bk := "baseKey"
-	retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+	retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(nil, 0))
 	oldExpected := stringsToEmptyInterface(ks)
 	assertFoundMGet(t, oldExpected, retrieved, err)
 	//let the values be expired
@@ -759,9 +647,9 @@ func mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routine
 	}
 
 	go func() {
-		retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MWaitFunc(bk, ks))
+		retrieved, err := c.MGetOrFetch(bk, ks, MWaitFunc(bk, ks))
 		if err != nil {
-			t.Logf("expected error:%v, value:%v", err,retrieved)
+			t.Logf("expected error:%v, value:%v", err, retrieved)
 		} else {
 			if !isEqual(retrieved, oldExpected) {
 				t.Errorf("Expected old value:%v, but we get %v, becuase error occur during fetch", oldExpected, retrieved)
@@ -777,13 +665,14 @@ func mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routine
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+			retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(nil, 0))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {
 				if !isEqual(retrieved, oldExpected) {
 					t.Errorf("Expected old value:%v, but we get %v, becuase error occur during fetch", oldExpected, retrieved)
-				}			}
+				}
+			}
 
 		}()
 	}
@@ -796,7 +685,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routine
 		go func() {
 			defer wg.Done()
 			//must return old values
-			retrieved, err := c.mGetOrFetchForceLatest(bk, ks, MKeyFunc(bk, ks))
+			retrieved, err := c.MGetOrFetch(bk, ks, keyMFetchFunc(nil, 0))
 			if err != nil {
 				t.Errorf("unexpected error:%v", err)
 			} else {
@@ -810,8 +699,7 @@ func mFirstRoutineReturnLatestValueWhenKeyExpireFetchError(t *testing.T, routine
 	wg.Wait()
 }
 
-
-func isEqual(a []interface{}, b [] interface{}) bool {
+func isEqual(a []interface{}, b []interface{}) bool {
 	if len(a) == len(b) {
 		count := 0
 		for i := range a {
@@ -823,3 +711,117 @@ func isEqual(a []interface{}, b [] interface{}) bool {
 	}
 	return false
 }
+
+func benchmark(b *testing.B, useSingleFlight bool, fetchDuration time.Duration, parallelism int) {
+	c, err := New(100, 500*time.Millisecond)
+	if err != nil {
+		b.Fatalf("unexpected error %v", err)
+	}
+
+	f := keyFetchFunc("", nil, fetchDuration)
+	jobs := make(chan int, parallelism)
+	for w := 0; w < parallelism; w++ {
+		go worker(c, f, jobs, useSingleFlight)
+	}
+
+	p := -1
+	for n := 0; n < b.N; n++ {
+		if n%parallelism == 0 {
+			p++
+		}
+		jobs <- p
+	}
+	close(jobs)
+}
+
+func worker(c *FetcherLRU, f FetchFunc, js <-chan int, useSingleFlight bool) {
+	for j := range js {
+		if useSingleFlight {
+			c.GetOrFetch(strconv.Itoa(j), f)
+		} else {
+			//c.GetWithoutSingleFlight(strconv.Itoa(j), f)
+		}
+	}
+}
+
+func BenchmarkSleep10Par0(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 1) }
+func BenchmarkSingleSleep10Par0(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 1) }
+
+func BenchmarkSleep10Par10(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 10) }
+func BenchmarkSingleSleep10Par10(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 10) }
+
+func BenchmarkSleep10Par100(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 100) }
+func BenchmarkSingleSleep10Par100(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 100) }
+
+func BenchmarkSleep10Par1000(b *testing.B)       { benchmark(b, false, 10*time.Millisecond, 1000) }
+func BenchmarkSingleSleep10Par1000(b *testing.B) { benchmark(b, true, 10*time.Millisecond, 1000) }
+
+func BenchmarkSleep100Par0(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 1) }
+func BenchmarkSingleSleep100Par0(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 1) }
+
+func BenchmarkSleep100Par10(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 10) }
+func BenchmarkSingleSleep100Par10(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 10) }
+
+func BenchmarkSleep100Par100(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 100) }
+func BenchmarkSingleSleep100Par100(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 100) }
+
+func BenchmarkSleep100Par1000(b *testing.B)       { benchmark(b, false, 100*time.Millisecond, 1000) }
+func BenchmarkSingleSleep100Par1000(b *testing.B) { benchmark(b, true, 100*time.Millisecond, 1000) }
+
+func BenchmarkSleep200Par0(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 1) }
+func BenchmarkSingleSleep200Par0(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 1) }
+
+func BenchmarkSleep200Par10(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 10) }
+func BenchmarkSingleSleep200Par10(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 10) }
+
+func BenchmarkSleep200Par100(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 100) }
+func BenchmarkSingleSleep200Par100(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 100) }
+
+func BenchmarkSleep200Par1000(b *testing.B)       { benchmark(b, false, 200*time.Millisecond, 1000) }
+func BenchmarkSingleSleep200Par1000(b *testing.B) { benchmark(b, true, 200*time.Millisecond, 1000) }
+
+func benchmarkExpensive(b *testing.B, useSingleFlight bool, parallelism int) {
+	c, err := New(100, 500*time.Millisecond)
+	if err != nil {
+		b.Fatalf("unexpected error %v", err)
+	}
+
+	f := func() (interface{}, error) {
+		return Fib(20), nil
+	}
+
+	jobs := make(chan int, parallelism)
+	for w := 0; w < parallelism; w++ {
+		go worker(c, f, jobs, useSingleFlight)
+	}
+
+	p := -1
+	for n := 0; n < b.N; n++ {
+		if n%parallelism == 0 {
+			p++
+		}
+		jobs <- p
+	}
+	close(jobs)
+}
+
+func Fib(n int) int {
+	if n < 2 {
+		return n
+	}
+	return Fib(n-1) + Fib(n-2)
+}
+
+func BenchmarkFibPar0(b *testing.B)       { benchmarkExpensive(b, false, 1) }
+func BenchmarkFibSinglePar0(b *testing.B) { benchmarkExpensive(b, true, 1) }
+
+func BenchmarkFibPar10(b *testing.B)       { benchmarkExpensive(b, false, 10) }
+func BenchmarkFibSinglePar10(b *testing.B) { benchmarkExpensive(b, true, 10) }
+
+func BenchmarkFibPar100(b *testing.B)       { benchmarkExpensive(b, false, 100) }
+func BenchmarkFibSinglePar100(b *testing.B) { benchmarkExpensive(b, true, 100) }
+
+func BenchmarkFibPar1000(b *testing.B)        { benchmarkExpensive(b, false, 1000) }
+func BenchmarkFibSinglePar1000(b *testing.B)  { benchmarkExpensive(b, true, 1000) }
+func BenchmarkFibPar10000(b *testing.B)       { benchmarkExpensive(b, false, 10000) }
+func BenchmarkFibSinglePar10000(b *testing.B) { benchmarkExpensive(b, true, 10000) }
