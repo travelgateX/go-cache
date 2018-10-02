@@ -17,7 +17,7 @@ type item struct {
 	// only one thread should be updating and when it does, the updating flag
 	// is set to true so the rest of threads know that this condition has been
 	// already treated
-	sync.RWMutex
+	sync.Mutex
 	updating bool
 }
 
