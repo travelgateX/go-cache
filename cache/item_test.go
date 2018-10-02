@@ -17,6 +17,7 @@ func TestExpiration(t *testing.T) {
 	}
 }
 
+// BenchmarkExpired_UnixNano-4     20000000                55.9 ns/op             0 B/op          0 allocs/op
 func BenchmarkExpired_UnixNano(b *testing.B) {
 	ttl := time.Millisecond
 	exp := time.Now().Add(ttl).UnixNano()
@@ -26,6 +27,7 @@ func BenchmarkExpired_UnixNano(b *testing.B) {
 	}
 }
 
+// BenchmarkExpired_Sub-4          20000000                58.2 ns/op             0 B/op          0 allocs/op
 func BenchmarkExpired_Sub(b *testing.B) {
 	ttl := time.Millisecond
 	exp := time.Now()
@@ -35,6 +37,7 @@ func BenchmarkExpired_Sub(b *testing.B) {
 	}
 }
 
+// BenchmarkExpiration_UnixNano-4          20000000                67.1 ns/op             0 B/op          0 allocs/op
 func BenchmarkExpiration_UnixNano(b *testing.B) {
 	ttl := time.Millisecond
 	for i := 0; i < b.N; i++ {
@@ -42,6 +45,7 @@ func BenchmarkExpiration_UnixNano(b *testing.B) {
 	}
 }
 
+// BenchmarkExpiration_Now-4               20000000                57.2 ns/op             0 B/op          0 allocs/op
 func BenchmarkExpiration_Now(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		time.Now()

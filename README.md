@@ -12,13 +12,13 @@ type FetchFunc func() (value interface{}, err error)
 The getter method for this cache requires a key and a FetchFunc that will be executed when the key is not found or has expired, the OnFetch result will be stored in cache for that key.
 
 - Its concurrent safe
-- Gets on expired keys
-    - default cause an update but are non-blocking, the old value is returned
-    - with ForceLatestValue option, the first routine will block , meanwhile other routines will get old value
-    - When an error occurs during fetch, if the key is expired return the old value, otherwise it return nil value 
 - Gets on missing keys are blocked until the OnFetch finishes
 - Ensures that only one OnFetch func is executed per key at the same time
 - Empty items are cached (nil values returned by a FetchFunc)
+- Gets on expired keys
+    - default cause an update but are non-blocking, the old value is returned
+    - with 'SetBlockOnUpdatingGoroutine' option, the goroutine calling for an update will block, meanwhile the value is updating, other goroutines will get the expired value
+- When an error occurs during a fetch func, if the key is expired it returns the old value, otherwise it returns nil value and scalates the error obtained in the fetch func 
 - Easy to implement :)
 
 Example of use where a service is wrapped into a cache layer using FetcherLRU:
