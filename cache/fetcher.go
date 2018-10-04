@@ -122,15 +122,14 @@ func (c *FetcherLRU) handleHit(key string, onFetch FetchFunc, i *item) *item {
 	}
 
 	i.Lock()
-	var tmpi *item
 	// double lock check
 	if !i.updating {
 		// tmpi can be an updated item or the same as 'i' depending on the cache configuration
-		tmpi = c.handleExpiration(key, onFetch, i)
+		tmpi := c.handleExpiration(key, onFetch, i)
+		i.Unlock()
+		return tmpi
 	}
 	i.Unlock()
-	i = tmpi
-
 	return i
 }
 
