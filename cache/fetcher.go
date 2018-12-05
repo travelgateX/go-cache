@@ -215,6 +215,29 @@ func gassert(key string, f func(key interface{}) (value interface{}, ok bool)) (
 	return nil, false
 }
 
+// Add forces an addition for a key's value
+func (c *FetcherLRU) Add(key string, value interface{}) {
+	c.add(key, value)
+}
+
+func (c *FetcherLRU) add(key string, value interface{}) *item {
+	var i *item
+	if value == nil {
+		i = newEmptyItem(c.ttl)
+	} else {
+		i = newItem(value, c.ttl)
+	}
+	evicted := c.cache.Add(key, i)
+	if evicted {
+		atomic.AddInt64(&c.stats.Evictions, 1)
+	}
+	return i
+}
+
+func (c *FetcherLRU) Remove(key string) {
+	c.cache.Remove(key)
+}
+
 // Result holds the results of Get, so they can be passed
 // on a channel.
 type Result struct {
@@ -369,25 +392,6 @@ func (c *FetcherLRU) MGetOrFetch(keyPrefix string, keySuffixes []string, onFetch
 	}
 
 	return ret, nil
-}
-
-// Add forces an addition for a key's value
-func (c *FetcherLRU) Add(key string, value interface{}) {
-	c.add(key, value)
-}
-
-func (c *FetcherLRU) add(key string, value interface{}) *item {
-	var i *item
-	if value == nil {
-		i = newEmptyItem(c.ttl)
-	} else {
-		i = newItem(value, c.ttl)
-	}
-	evicted := c.cache.Add(key, i)
-	if evicted {
-		atomic.AddInt64(&c.stats.Evictions, 1)
-	}
-	return i
 }
 
 type StatsFetcherLRU struct {
